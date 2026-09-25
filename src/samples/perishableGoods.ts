@@ -271,7 +271,7 @@ class PerishableGoodsLogic extends TemplateLogic<ITemplateModel, IPerishableGood
             // owed, so no payout is made and the state carries forward untouched.
             const lateResult: IPriceCalculation = {
                 $class: "org.accordproject.perishablegoods@0.2.0.PriceCalculation",
-                $timestamp: arrival,
+                $timestamp: arrival.toISOString(),
                 totalPrice: 0.0,
                 penalty: 0.0,
                 currencyCode: currency,
@@ -309,7 +309,7 @@ class PerishableGoodsLogic extends TemplateLogic<ITemplateModel, IPerishableGood
 
         const event: IPerishableGoodsPaymentEvent = {
             $class: "org.accordproject.perishablegoods@0.2.0.PerishableGoodsPaymentEvent",
-            $timestamp: arrival,
+            $timestamp: arrival.toISOString(),
             $identifier: data.contractId + "-payment",
             // An Obligation carries a back-reference to the governing contract. The
             // generated type models it as the target interface, but the wire format
@@ -323,7 +323,7 @@ class PerishableGoodsLogic extends TemplateLogic<ITemplateModel, IPerishableGood
 
         const result: IPriceCalculation = {
             $class: "org.accordproject.perishablegoods@0.2.0.PriceCalculation",
-            $timestamp: arrival,
+            $timestamp: arrival.toISOString(),
             totalPrice,
             penalty: totalPenalty,
             currencyCode: currency,

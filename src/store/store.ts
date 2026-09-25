@@ -39,8 +39,9 @@ import tour from "../components/Tour";
  * hand-edited in the runner rather than produced by a run.
  *
  * Persisted to localStorage (see `getInitialChain`/`persistChain`) so a page
- * refresh doesn't lose the sequence. This was previously `LogicExecutionResult`,
- * an unused placeholder for the same idea — renamed and filled in here.
+ * refresh doesn't lose the sequence. This is the "current chain" model used
+ * to drive the stepper UI; `executionHistory` (below) is a parallel, flatter
+ * log of every run (including failed ones) used by the Simulate view.
  */
 export interface ChainStep {
   /** Label shown in the stepper ("Init", "Trigger 1", ...). */
@@ -57,6 +58,36 @@ export interface ChainStep {
   events: object[];
   /** True once this step's `state` was hand-edited rather than produced by a run. */
   edited: boolean;
+}
+
+/**
+ * One `init` or `trigger` execution, stored in `executionHistory` to track the
+ * evolution of the contract state over time. Unlike `executionChain`, failed
+ * runs are kept too, so the Simulate view can show what was sent and why it
+ * was rejected. Populated alongside `executionChain` by `initContract` and
+ * `triggerContract`, from whichever engine (compiled TypeScript or LLM) ran.
+ */
+export interface LogicExecutionResult {
+  /** "init" for the initialisation run, then "#1", "#2", … for triggers. */
+  id: string;
+  method: "init" | "trigger";
+  /** Contract data for `init`, the request payload for `trigger`. */
+  request: object;
+  /** `result` of a trigger, or `{ state, events }` of an init. Null when the run failed. */
+  response: object | null;
+  stateBefore: object | null;
+  stateAfter: object | null;
+  events: object[];
+  /** Formatted error message when the run threw; null on success. */
+  error: string | null;
+  /**
+   * Where a failed run stopped: "parse" when the request/data JSON could not
+   * be read (nothing was sent to the logic), "run" when the logic itself, or
+   * the engine invoking it, threw.
+   */
+  stage: "parse" | "run";
+  durationMs: number;
+  executedAt: string; // ISO timestamp
 }
 
 interface AppState {
@@ -159,18 +190,21 @@ interface AppState {
   setKeyProtectionLevel: (level: KeyProtectionLevel | null) => void;
   isLogicFeatureEnabled: boolean;
   setLogicFeatureEnabled: (value: boolean) => void;
+  /** Feature flag for the new playground design (work in progress). */
+  isDesignV2Enabled: boolean;
+  setDesignV2Enabled: (value: boolean) => void;
   /**
    * Updates the live editor value without committing or triggering compilation.
    * @param ts - The current TypeScript source from the editor
    */
   setEditorLogicTs: (ts: string) => void;
-  
+
   /**
    * Commits the logic source, synchronizes the editor state, and triggers an immediate compilation.
    * @param ts - The new TypeScript source to commit
    */
   setLogicTs: (ts: string) => Promise<void>;
-  
+
   /**
    * Orchestrates the compilation of the currently committed `logicTs` via the
    * TemplateArchiveProcessor. Updates state with the resulting JS code or
@@ -182,25 +216,25 @@ interface AppState {
    * (grammar, model, logic) using JSZip. This object is required by the engine for compilation.
    */
   buildTemplateFromMemory: () => Promise<void>;
-  
+
   /**
    * Registers the reference to the sandboxed iframe element once mounted.
    * @param iframe - The HTMLIFrameElement instance
    */
   setSandboxRef: (iframe: HTMLIFrameElement | null) => void;
-  
+
   /**
    * Marks the sandbox as ready to receive execution requests.
    * Called when the iframe signals it has successfully initialized.
    * @param ready - True if ready, false otherwise
    */
   setSandboxReady: (ready: boolean) => void;
-  
+
   /**
    * Executes a compiled contract logic method inside the isolated iframe sandbox.
    * Coordinates the cross-origin postMessage workflow and registers a resolver
    * to await the asynchronous response from the Web Worker.
-   * 
+   *
    * @param code - The compiled JavaScript code string to execute
    * @param method - The contract logic method to invoke ('init' or 'trigger')
    * @param args - The arguments array to pass to the method
@@ -246,7 +280,8 @@ interface AppState {
    * Discards every execution artifact and returns the runner to its pre-init
    * state. Called when the engine changes, since a response, state or event
    * produced by one engine says nothing about what the next one would do.
-   * Also clears the execution chain (see below) and its persisted copy.
+   * Also clears the execution chain and the execution history (and their
+   * persisted copies).
    */
   resetExecution: () => void;
 
@@ -296,6 +331,14 @@ interface AppState {
   lastExecutionEngine: ExecutionEngine | null;
 
   /**
+   * Every run since the last `init`, oldest first, mirroring `executionChain`
+   * but flat and including failed runs. `initContract` starts a fresh
+   * history; `triggerContract` appends one entry per request, failed or not.
+   */
+  executionHistory: LogicExecutionResult[];
+  clearExecutionHistory: () => void;
+
+  /**
    * Runs `init` or `trigger` through the LLM executor, using the provider,
    * model and API key held in `aiConfig`.
    *
@@ -313,13 +356,13 @@ interface AppState {
   /** The current request payload (JSON string) used as input for the next trigger. */
   requestJson: string;
   setRequestJson: (json: string) => void;
-  
+
   /**
    * Initializes the contract logic. Dispatches the `init` method to the sandbox
    * using the current contract data, and stores the resulting state and events.
    */
   initContract: () => Promise<void>;
-  
+
   /**
    * Triggers the contract logic. Dispatches the `trigger` method to the sandbox
    * using the current data, request, and accumulated state, then updates the UI
@@ -562,6 +605,16 @@ const useAppStore = create<AppState>()(
           }
           set({ isLogicFeatureEnabled: value });
         },
+        isDesignV2Enabled:
+          typeof window !== "undefined"
+            ? localStorage.getItem("isDesignV2Enabled") === "true"
+            : false,
+        setDesignV2Enabled: (value: boolean) => {
+          if (typeof window !== "undefined") {
+            localStorage.setItem("isDesignV2Enabled", String(value));
+          }
+          set({ isDesignV2Enabled: value });
+        },
         logicTs: "",
         editorLogicTs: "",
         compiledLogicJs: null,
@@ -577,6 +630,9 @@ const useAppStore = create<AppState>()(
         executionState: initialChainStep ? JSON.stringify(initialChainStep.state, null, 2) : '',
         executionEvents: initialChainStep ? JSON.stringify(initialChainStep.events, null, 2) : '',
         executionResponse: initialChainStep?.result ? JSON.stringify(initialChainStep.result, null, 2) : '',
+
+        executionHistory: [],
+        clearExecutionHistory: () => set({ executionHistory: [] }),
 
         llmExecutionMode: getInitialLLMExecutionMode(),
         setLLMExecutionMode: (mode: LLMMode) => {
@@ -609,6 +665,7 @@ const useAppStore = create<AppState>()(
             lastExecutionEngine: null,
             executionChain: [],
             selectedChainIndex: -1,
+            executionHistory: [],
           });
           persistChain([]);
         },
@@ -773,6 +830,7 @@ const useAppStore = create<AppState>()(
               executionResponse: '',
               executionState: '',
               executionEvents: '',
+              executionHistory: [],
               isContractInitialized: false,
               lastExecutionEngine: null,
               executionChain: [],
@@ -896,10 +954,11 @@ const useAppStore = create<AppState>()(
             const hasLogic = Boolean(logicTs && logicTs.trim().length > 0);
             /*
              * A shared link loads a different template — nothing the last one
-             * produced (including its execution chain) applies here. This was
-             * a pre-existing gap (loadSample already did this); the chain
-             * persisting across page loads makes it worth closing now, since
-             * otherwise a stale chain could leak into an unrelated template.
+             * produced (including its execution chain/history) applies here.
+             * This was a pre-existing gap (loadSample already did this); the
+             * chain persisting across page loads makes it worth closing now,
+             * since otherwise a stale chain could leak into an unrelated
+             * template.
              */
             get().resetExecution();
             set(() => ({
@@ -1365,13 +1424,17 @@ const useAppStore = create<AppState>()(
           /*
            * Init starts a fresh run of the contract, so anything left over from
            * the last one goes first — otherwise the Response tab keeps showing
-           * a trigger result that this init did not produce.
+           * a trigger result that this init did not produce. This also clears
+           * executionHistory, since a fresh init starts a fresh history too.
            */
           get().resetExecution();
           set({ executingOperation: 'init' });
 
+          const startedAt = Date.now();
+          let parsedData: object = {};
+
           try {
-            const parsedData: unknown = JSON.parse(data);
+            parsedData = JSON.parse(data) as object;
             const output = useTypeScript
               ? (await get().executeInSandbox(compiledLogicJs!, 'init', [parsedData])) as { state?: unknown; events?: unknown[] }
               : (await get().executeWithLLM('init', { data: parsedData })) as { state?: unknown; events?: unknown[] };
@@ -1383,20 +1446,35 @@ const useAppStore = create<AppState>()(
              * calling this when a chain already exists, so clearing it here
              * is safe.
              */
+            const events = Array.isArray(output.events) ? (output.events as object[]) : [];
             const initStep: ChainStep = {
               label: 'Init',
               request: null,
               priorState: null,
               result: null,
               state: (output.state ?? {}) as object,
-              events: (output.events ?? []) as object[],
+              events,
               edited: false,
             };
             const chain = [initStep];
+            const historyEntry: LogicExecutionResult = {
+              id: 'init',
+              method: 'init',
+              request: parsedData,
+              response: { state: initStep.state, events },
+              stateBefore: null,
+              stateAfter: initStep.state,
+              events,
+              error: null,
+              stage: 'run',
+              durationMs: Date.now() - startedAt,
+              executedAt: new Date(startedAt).toISOString(),
+            };
 
             set({
               executionChain: chain,
               selectedChainIndex: 0,
+              executionHistory: [historyEntry],
               isContractInitialized: true,
               lastExecutionEngine: useTypeScript ? ExecutionEngine.TypeScript : ExecutionEngine.LLM,
               compilationErrors: []
@@ -1404,8 +1482,22 @@ const useAppStore = create<AppState>()(
             syncChainDisplay(initStep);
             persistChain(chain);
           } catch (err: unknown) {
+            const message = formatError(err);
             set({
-              compilationErrors: [{ message: `Execution Error: ${formatError(err)}` }],
+              executionHistory: [{
+                id: 'init',
+                method: 'init',
+                request: parsedData,
+                response: null,
+                stateBefore: null,
+                stateAfter: null,
+                events: [],
+                error: message,
+                stage: 'run',
+                durationMs: Date.now() - startedAt,
+                executedAt: new Date(startedAt).toISOString(),
+              }],
+              compilationErrors: [{ message: `Execution Error: ${message}` }],
               isProblemPanelVisible: true
             });
           } finally {
@@ -1414,7 +1506,7 @@ const useAppStore = create<AppState>()(
         },
 
         triggerContract: async () => {
-          const { compiledLogicJs, data, requestJson, executionState, isTemplateStateful, isContractInitialized, llmExecutionMode, executeInSandbox, executionChain, selectedChainIndex } = get();
+          const { compiledLogicJs, data, requestJson, executionState, isTemplateStateful, isContractInitialized, llmExecutionMode, executeInSandbox, executionChain, selectedChainIndex, executionHistory } = get();
 
           const forceLLM = llmExecutionMode === 'force';
           const useTypeScript = !forceLLM && !!compiledLogicJs;
@@ -1466,14 +1558,34 @@ const useAppStore = create<AppState>()(
 
           set({ executingOperation: 'trigger' });
 
+          const startedAt = Date.now();
+          const triggerCount = executionHistory.filter((r) => r.method === "trigger").length;
+          const historyId = `#${triggerCount + 1}`;
+          let parsedRequest: object = {};
+          let parsedState: object | null = null;
+          let stage: LogicExecutionResult["stage"] = "run";
+
           try {
-            const parsedData: unknown = JSON.parse(data);
-            const parsedRequest: unknown = JSON.parse(requestJson);
-            const parsedState: unknown = executionState ? JSON.parse(executionState) : {};
+            const parsedData = JSON.parse(data) as object;
+            try {
+              parsedState = executionState ? (JSON.parse(executionState) as object) : {};
+            } catch (parseErr) {
+              stage = "parse";
+              throw parseErr;
+            }
+            try {
+              parsedRequest = JSON.parse(requestJson) as object;
+            } catch (parseErr) {
+              // Nothing reaches the logic: report it as a request problem, not a trigger() failure
+              stage = "parse";
+              throw parseErr;
+            }
 
             const output = useTypeScript
               ? (await executeInSandbox(compiledLogicJs!, 'trigger', [parsedData, parsedRequest, parsedState])) as { result?: unknown, state?: unknown, events?: unknown[] }
               : (await get().executeWithLLM('trigger', { data: parsedData, request: parsedRequest, priorState: parsedState })) as { result?: unknown, state?: unknown, events?: unknown[] };
+
+            const events = Array.isArray(output.events) ? (output.events as object[]) : [];
 
             /*
              * Extract and store execution artifacts.
@@ -1485,6 +1597,19 @@ const useAppStore = create<AppState>()(
               executionState: output.state ? JSON.stringify(output.state, null, 2) : executionState,
               executionEvents: output.events ? JSON.stringify(output.events, null, 2) : '[]',
               lastExecutionEngine: useTypeScript ? ExecutionEngine.TypeScript : ExecutionEngine.LLM,
+              executionHistory: [...executionHistory, {
+                id: historyId,
+                method: 'trigger',
+                request: parsedRequest,
+                response: (output.result as object | undefined) ?? null,
+                stateBefore: parsedState,
+                stateAfter: (output.state as object | undefined) ?? parsedState,
+                events,
+                error: null,
+                stage: 'run',
+                durationMs: Date.now() - startedAt,
+                executedAt: new Date(startedAt).toISOString(),
+              }],
               compilationErrors: []
             });
 
@@ -1500,7 +1625,7 @@ const useAppStore = create<AppState>()(
                 priorState: parsedState as object,
                 result: (output.result ?? {}) as object,
                 state: (output.state ?? parsedState) as object,
-                events: (output.events ?? []) as object[],
+                events,
                 edited: false,
               };
               const chain = [...executionChain, newStep];
@@ -1508,8 +1633,23 @@ const useAppStore = create<AppState>()(
               persistChain(chain);
             }
           } catch (err: unknown) {
+            const message = formatError(err);
             set({
-              compilationErrors: [{ message: `Execution Error: ${formatError(err)}` }],
+              executionHistory: [...executionHistory, {
+                id: historyId,
+                method: 'trigger',
+                request: parsedRequest,
+                response: null,
+                // State is left untouched by a failed trigger, so before === after
+                stateBefore: parsedState,
+                stateAfter: parsedState,
+                events: [],
+                error: message,
+                stage,
+                durationMs: Date.now() - startedAt,
+                executedAt: new Date(startedAt).toISOString(),
+              }],
+              compilationErrors: [{ message: `Execution Error: ${message}` }],
               isProblemPanelVisible: true
             });
           } finally {
