@@ -410,6 +410,15 @@ export function buildLLMExecutorConfig(
         ? { temperature: config.temperature }
         : {}),
       ...(config.maxTokens ? { maxTokens: config.maxTokens } : {}),
+      // template-engine's Reasoners construct their SDK clients internally
+      // (see Reasoners.js getClient()) and spread this straight into the
+      // client constructor. The playground runs entirely client-side with a
+      // user-supplied key (see AnthropicProvider.streamChat above, which
+      // already sets this for the chat panel's own client) — this is the
+      // equivalent flag for the Contract Runner's execution path, which
+      // constructs its SDK clients separately inside template-engine and
+      // never previously received this option.
+      clientOptions: { dangerouslyAllowBrowser: true },
     } as LLMProviderConfig,
     verbose: import.meta.env.DEV,
   };
